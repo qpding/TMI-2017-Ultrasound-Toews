@@ -50,8 +50,8 @@ either expressed or implied, of the FreeBSD Project.
 #include <map>
 using namespace std;
 
-#include "neldermead.h"
-//#include "nlopt.h"
+//#include "neldermead.h"
+#include "nlopt.h"
 
 #define PARAMETER_DIM_ROT 3
 #define PARAMETER_DIM_RIG 7
@@ -4459,5 +4459,6 @@ main(
 
 	return 1;
 }
+
 
 
