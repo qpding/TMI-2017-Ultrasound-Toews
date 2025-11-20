@@ -52,10 +52,51 @@ class KeypointRecord:
         )
 
 
+@dataclass
+class SequenceEntry:
+    """One row from a legacy ``*.txt`` ultrasound sweep description."""
+
+    image_path: Path
+    frame_index: int
+    pose: np.ndarray  # 4x4 homogeneous transform
+
+
 def read_image_list(image_list: Path) -> List[Path]:
     """Load newline-delimited image paths from a text file."""
 
     return [Path(line.strip()) for line in image_list.read_text().splitlines() if line.strip()]
+
+
+def read_sequence_with_poses(sequence_file: Path) -> List[SequenceEntry]:
+    """Parse a sweep description file containing image paths and 4x4 probe poses."""
+
+    entries: List[SequenceEntry] = []
+    for line in sequence_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 14:
+            raise ValueError(
+                f"Expected at least 14 columns (path, index, 12+ pose values) in '{sequence_file}', got {len(parts)}."
+            )
+
+        image_path = Path(parts[0])
+        frame_index = int(parts[1])
+        pose_values = [float(v) for v in parts[2:]]
+
+        if len(pose_values) == 16:
+            pose = np.array(pose_values, dtype=np.float32).reshape(4, 4)
+        elif len(pose_values) == 12:
+            pose = np.eye(4, dtype=np.float32)
+            pose[:3, :] = np.array(pose_values, dtype=np.float32).reshape(3, 4)
+        else:
+            raise ValueError(
+                f"Unsupported pose column count ({len(pose_values)}) in '{sequence_file}'. Expected 12 or 16 entries."
+            )
+
+        entries.append(SequenceEntry(image_path=image_path, frame_index=frame_index, pose=pose))
+
+    return entries
 
 
 def serialize_keypoints(keypoints: List[cv2.KeyPoint]) -> List[Dict[str, object]]:
@@ -93,24 +134,41 @@ def save_database(
     image_paths: List[Path],
     keypoints: List[List[cv2.KeyPoint]],
     descriptors: List[np.ndarray],
+    poses: List[np.ndarray] | None = None,
 ) -> None:
     serialized = [serialize_keypoints(kps) for kps in keypoints]
-    np.savez_compressed(
-        output_path,
-        detector=detector_name,
-        images=np.array([str(p) for p in image_paths]),
-        keypoints=np.array(serialized, dtype=object),
-        descriptors=np.array(descriptors, dtype=object),
-    )
+    archive_kwargs = {
+        "detector": detector_name,
+        "images": np.array([str(p) for p in image_paths]),
+        "keypoints": np.array(serialized, dtype=object),
+        "descriptors": np.array(descriptors, dtype=object),
+    }
+    if poses is not None:
+        archive_kwargs["poses"] = np.array(poses, dtype=np.float32)
+
+    np.savez_compressed(output_path, **archive_kwargs)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract ORB/SIFT features and store them in an NPZ database.")
-    parser.add_argument("image_list", type=Path, help="Path to a text file containing newline-separated image paths.")
+    parser.add_argument(
+        "image_list",
+        type=Path,
+        help=(
+            "Path to a text file containing newline-separated image paths."
+            " Ignored when --sequence is provided."
+        ),
+    )
     parser.add_argument("output", type=Path, help="Path to the output NPZ file (e.g., descriptors.npz).")
     parser.add_argument("--mask", type=Path, default=None, help="Optional mask image applied to every input image.")
     parser.add_argument("--detector", choices=["ORB", "SIFT"], default="ORB", help="Feature detector/descriptor to use.")
     parser.add_argument("--nfeatures", type=int, default=500, help="Maximum number of features per image.")
+    parser.add_argument(
+        "--sequence",
+        type=Path,
+        default=None,
+        help="Optional sweep description file containing image paths and 4x4 probe poses.",
+    )
 
     args = parser.parse_args()
 
@@ -120,7 +178,16 @@ def main() -> None:
         if mask is None:
             raise FileNotFoundError(f"Could not read mask '{args.mask}'.")
 
-    image_paths = read_image_list(args.image_list)
+    sequence_entries: List[SequenceEntry] | None = None
+    poses: List[np.ndarray] | None = None
+
+    if args.sequence:
+        sequence_entries = read_sequence_with_poses(args.sequence)
+        image_paths = [entry.image_path for entry in sequence_entries]
+        poses = [entry.pose for entry in sequence_entries]
+        print(f"Loaded {len(image_paths)} frames with poses from {args.sequence}")
+    else:
+        image_paths = read_image_list(args.image_list)
     detector = create_detector(args.detector, args.nfeatures)
 
     all_keypoints: List[List[cv2.KeyPoint]] = []
@@ -132,7 +199,7 @@ def main() -> None:
         all_descriptors.append(desc)
         print(f"{path}: {len(kps)} keypoints")
 
-    save_database(args.output, args.detector, image_paths, all_keypoints, all_descriptors)
+    save_database(args.output, args.detector, image_paths, all_keypoints, all_descriptors, poses=poses)
 
     meta = {
         "detector": args.detector,
