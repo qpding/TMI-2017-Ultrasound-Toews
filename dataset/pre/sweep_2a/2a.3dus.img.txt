@@ -1,0 +1,8 @@
+Features:	1
+x:	294
+y:	233
+z:	353
+t:	1
+data:	2a.3dus.img.img
+means: -431602080.000000
+variances: -431602080.000000
