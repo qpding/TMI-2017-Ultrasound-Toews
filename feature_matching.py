@@ -14,7 +14,12 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 
-from feature_extraction import create_detector, deserialize_keypoints
+from feature_extraction import (
+    SequenceEntry,
+    create_detector,
+    deserialize_keypoints,
+    read_sequence_with_poses,
+)
 
 
 def load_database(npz_path: Path):
@@ -23,8 +28,11 @@ def load_database(npz_path: Path):
     images: List[str] = data["images"].tolist()
     keypoints_serialized = data["keypoints"].tolist()
     descriptors: List[np.ndarray] = data["descriptors"].tolist()
+    poses = None
+    if "poses" in data:
+        poses = data["poses"]
     keypoints = [deserialize_keypoints(kps) for kps in keypoints_serialized]
-    return detector_name, images, keypoints, descriptors
+    return detector_name, images, keypoints, descriptors, poses
 
 
 def configure_matcher(detector: str) -> cv2.DescriptorMatcher:
@@ -62,17 +70,213 @@ def visualize_best(
     print(f"Saved visualization to {output_path}")
 
 
+def normalize_path_key(path: str | Path) -> str:
+    return Path(path).as_posix()
+
+
+class PoseLookup:
+    """Resolve 4x4 poses for image paths with optional basename fallback."""
+
+    def __init__(self, entries: List[SequenceEntry]):
+        self.by_path: Dict[str, np.ndarray] = {}
+        self.by_basename: Dict[str, np.ndarray | None] = {}
+        for entry in entries:
+            key = normalize_path_key(entry.image_path)
+            pose = np.array(entry.pose, dtype=np.float32)
+            self.by_path[key] = pose
+
+            basename = entry.image_path.name
+            if basename in self.by_basename:
+                self.by_basename[basename] = None  # ambiguous basename
+            else:
+                self.by_basename[basename] = pose
+
+    def get(self, path: str | Path) -> np.ndarray:
+        key = normalize_path_key(path)
+        if key in self.by_path:
+            return self.by_path[key]
+
+        basename = Path(path).name
+        pose = self.by_basename.get(basename)
+        if pose is not None:
+            return pose
+
+        raise KeyError(f"No pose found for image '{path}'. Make sure the sequence file matches the database paths.")
+
+
+def flatten_pose(pose: np.ndarray) -> np.ndarray:
+    """Return the top 3x4 rows of a 4x4 matrix as a 12-element vector."""
+
+    pose = np.asarray(pose)
+    if pose.shape == (3, 4):
+        return pose.astype(np.float32).reshape(-1)
+    if pose.shape == (4, 4):
+        return pose[:3, :].astype(np.float32).reshape(-1)
+    raise ValueError(f"Unsupported pose shape {pose.shape}; expected (3,4) or (4,4).")
+
+
+def write_non_linear_outputs(vec_x: List[np.ndarray], vec_y: List[np.ndarray], output_prefix: Path) -> None:
+    x_path = output_prefix.with_suffix(".non-linear.matches.X")
+    y_path = output_prefix.with_suffix(".non-linear.matches.Y")
+    if not vec_x or not vec_y:
+        raise RuntimeError("No correspondences were generated; cannot write non-linear match files.")
+
+    np.savetxt(x_path, np.vstack(vec_x), fmt="%.8f")
+    np.savetxt(y_path, np.vstack(vec_y), fmt="%.8f")
+    print(f"Wrote {len(vec_x)} correspondences to {x_path} and {y_path}")
+
+
+def build_pose_lookup(
+    images: List[str], poses: np.ndarray | None, sequence_file: Path | None, detector_name: str
+) -> PoseLookup:
+    if poses is not None:
+        if len(poses) != len(images):
+            raise ValueError(
+                f"Pose count ({len(poses)}) does not match the number of database images ({len(images)})."
+            )
+        entries = [SequenceEntry(Path(path), idx, pose) for idx, (path, pose) in enumerate(zip(images, poses))]
+        return PoseLookup(entries)
+
+    if sequence_file is None:
+        raise ValueError(
+            "A training sequence file with poses is required because the database does not contain pose matrices."
+        )
+
+    train_entries = read_sequence_with_poses(sequence_file)
+    lookup = PoseLookup(train_entries)
+
+    # Sanity-check that every database image has a pose.
+    missing = []
+    for path in images:
+        try:
+            lookup.get(path)
+        except KeyError:
+            missing.append(path)
+
+    if missing:
+        msg = (
+            "Some database images are missing poses. Ensure your --train-sequence file uses the same paths or unique"
+            " basenames. Missing: "
+            + ", ".join(missing[:5])
+        )
+        if len(missing) > 5:
+            msg += f" (and {len(missing) - 5} more)"
+        raise ValueError(msg)
+
+    print(
+        f"Loaded {len(train_entries)} training poses for {len(images)} database images using {detector_name} descriptors."
+    )
+    return lookup
+
+
+def generate_non_linear_matches(
+    query_sequence: Path,
+    database_images: List[str],
+    database_keypoints: List[List[cv2.KeyPoint]],
+    database_descriptors: List[np.ndarray],
+    database_poses: PoseLookup,
+    detector: cv2.Feature2D,
+    matcher: cv2.DescriptorMatcher,
+    ratio: float,
+    output_prefix: Path,
+) -> None:
+    query_entries = read_sequence_with_poses(query_sequence)
+    correspondences_x: List[np.ndarray] = []
+    correspondences_y: List[np.ndarray] = []
+
+    for entry_idx, entry in enumerate(query_entries):
+        query_img = cv2.imread(str(entry.image_path), cv2.IMREAD_GRAYSCALE)
+        if query_img is None:
+            raise FileNotFoundError(f"Could not read query image '{entry.image_path}'.")
+
+        query_kp, query_desc = detector.detectAndCompute(query_img, None)
+        if query_desc is None or len(query_desc) == 0:
+            print(f"{entry.image_path}: no keypoints found; skipping frame {entry_idx}.")
+            continue
+
+        query_pose = flatten_pose(entry.pose)
+
+        for train_path, train_kp, train_desc in zip(database_images, database_keypoints, database_descriptors):
+            matches = match_descriptors(matcher, query_desc, train_desc, ratio=ratio)
+            if not matches:
+                continue
+
+            train_pose = flatten_pose(database_poses.get(train_path))
+            for match in matches:
+                q_pt = query_kp[match.queryIdx].pt
+                t_pt = train_kp[match.trainIdx].pt
+
+                row_x = np.concatenate([query_pose, np.array([q_pt[0], q_pt[1], 0.0], dtype=np.float32)])
+                row_y = np.concatenate([train_pose, np.array([t_pt[0], t_pt[1], 0.0], dtype=np.float32)])
+                correspondences_x.append(row_x)
+                correspondences_y.append(row_y)
+
+        print(f"Processed frame {entry_idx + 1}/{len(query_entries)} with {len(query_kp)} keypoints.")
+
+    write_non_linear_outputs(correspondences_x, correspondences_y, output_prefix)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Match query features against a precomputed database.")
-    parser.add_argument("query_image", type=Path, help="Path to the query image.")
+    parser.add_argument(
+        "query_image",
+        type=Path,
+        nargs="?",
+        help="Path to the query image. Not required when --query-sequence is supplied.",
+    )
     parser.add_argument("database", type=Path, help="NPZ database produced by feature_extraction.py")
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe ratio test threshold.")
     parser.add_argument("--visualize", type=Path, default=None, help="Optional output image path for the best-matching training image.")
+    parser.add_argument(
+        "--query-sequence",
+        type=Path,
+        default=None,
+        help="Sweep description file whose frames should be matched to the database to produce *.non-linear.matches outputs.",
+    )
+    parser.add_argument(
+        "--train-sequence",
+        type=Path,
+        default=None,
+        help="Sequence file containing pose matrices for the training/database images (needed when the NPZ lacks poses).",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=Path,
+        default=None,
+        help="Prefix for writing *.non-linear.matches.X/Y when --query-sequence is set (defaults to the query sequence path).",
+    )
+    parser.add_argument(
+        "--query-nfeatures",
+        type=int,
+        default=2000,
+        help="Number of features to compute per query frame when exporting non-linear matches.",
+    )
     args = parser.parse_args()
 
-    detector_name, image_paths, db_keypoints, db_desc = load_database(args.database)
-    detector = create_detector(detector_name, nfeatures=2000)
+    detector_name, image_paths, db_keypoints, db_desc, db_poses = load_database(args.database)
     matcher = configure_matcher(detector_name)
+
+    if args.query_sequence:
+        detector = create_detector(detector_name, nfeatures=args.query_nfeatures)
+        output_prefix = args.output_prefix or args.query_sequence
+        pose_lookup = build_pose_lookup(image_paths, db_poses, args.train_sequence, detector_name)
+        generate_non_linear_matches(
+            args.query_sequence,
+            image_paths,
+            db_keypoints,
+            db_desc,
+            pose_lookup,
+            detector,
+            matcher,
+            ratio=args.ratio,
+            output_prefix=output_prefix,
+        )
+        return
+
+    if args.query_image is None:
+        raise ValueError("query_image is required unless --query-sequence is specified.")
+
+    detector = create_detector(detector_name, nfeatures=2000)
 
     query_img = cv2.imread(str(args.query_image), cv2.IMREAD_GRAYSCALE)
     if query_img is None:

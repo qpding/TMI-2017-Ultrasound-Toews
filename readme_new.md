@@ -21,17 +21,23 @@ macOS, and Windows as long as OpenCV is installed.
 
 ```bash
 python feature_extraction.py <image_list.txt> <output_db.npz> \
-  --mask mask.png --detector ORB --nfeatures 750
+  --mask mask.png --detector ORB --nfeatures 750 \
+  --sequence sweep_2c.txt
 ```
 
 - ``image_list.txt``: newline-delimited paths to the training images
-  (absolute or relative).
+  (absolute or relative). Ignored when ``--sequence`` is provided.
 - ``output_db.npz``: compressed database containing per-image keypoints
   and descriptors plus a small ``.json`` metadata sidecar.
 - ``--mask`` (optional): grayscale mask applied to every image to ignore
   irrelevant pixels.
 - ``--detector``: ``ORB`` (default) or ``SIFT``.
 - ``--nfeatures``: maximum number of features to retain per image.
+- ``--sequence`` (optional): legacy sweep description file containing an
+  image path, frame index, and 12/16 pose entries per line. When
+  supplied, the script derives the image list from this file and embeds
+  the corresponding 4×4 probe poses into the NPZ archive for downstream
+  calibration.
 
 The database stores keypoints in a JSON-friendly structure so they can
 be reconstructed later. The console output echoes the number of detected
@@ -44,13 +50,28 @@ image against each training image using a Lowe ratio test and a
 BFMatcher tuned to the descriptor type.
 
 ```bash
+# Single-image scoring/visualization (original behavior)
 python feature_matching.py <query_image.png> <output_db.npz> \
   --ratio 0.75 --visualize best_match.png
+
+# Generate *.non-linear.matches.X/Y for autocalibration
+python feature_matching.py --query-sequence sweep_2c.txt output_db.npz \
+  --train-sequence sweep_2a.txt --output-prefix sweep_2c.txt
 ```
 
-The script prints the number of surviving matches for each training
-image, identifies the best-scoring candidate, and optionally writes a
-match visualization for the top result.
+The single-image mode prints the number of surviving matches for each
+training image, identifies the best-scoring candidate, and optionally
+writes a match visualization for the top result.
+
+When ``--query-sequence`` is supplied, the script iterates over every
+frame listed in the sweep description, recomputes keypoints for that
+frame using the database's detector type, and matches it against each
+database image. The resulting correspondence rows—each containing a 3×4
+pose followed by the matched keypoint (``x, y, 0``)—are saved to the
+``*.non-linear.matches.X``/``*.Y`` text files expected by
+``autocalibration.py``. Probe poses are pulled from the NPZ archive when
+available or from ``--train-sequence`` otherwise (paths or unique
+basenames must match between the NPZ and sequence file).
 
 ## 3) Autocalibration
 
