@@ -44,11 +44,11 @@ class KeypointRecord:
         return cv2.KeyPoint(
             x=float(self.pt[0]),
             y=float(self.pt[1]),
-            _size=float(self.size),
-            _angle=float(self.angle),
-            _response=float(self.response),
-            _octave=int(self.octave),
-            _class_id=int(self.class_id),
+            size=float(self.size),
+            angle=float(self.angle),
+            response=float(self.response),
+            octave=int(self.octave),
+            class_id=int(self.class_id),
         )
 
 
